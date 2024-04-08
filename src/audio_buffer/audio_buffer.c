@@ -16,7 +16,6 @@ typedef struct rdx_audio_buffer {
     size_t buffer_size_in_bytes;
     char* data_buffers[3];
     char current_buffer;
-    int read_interleaved;
     int sample_rate;
     int num_channels;
     //---
@@ -30,7 +29,7 @@ typedef struct rdx_audio_buffer {
     //---
 } rdx_audio_buffer;
 
-rdx_audio_buffer* rdx_create_audio_stream(size_t buffer_size_in_bytes,bool read_interleaved, void* (*alloc)(size_t), void (*dealloc)(void*)) {
+rdx_audio_buffer* rdx_create_audio_stream(size_t buffer_size_in_bytes, void* (*alloc)(size_t), void (*dealloc)(void*)) {
     rdx_audio_buffer* new_buffer = alloc(sizeof *new_buffer );
     new_buffer->alloc = alloc;
     new_buffer->dealloc = dealloc;
@@ -39,7 +38,6 @@ rdx_audio_buffer* rdx_create_audio_stream(size_t buffer_size_in_bytes,bool read_
     new_buffer->data_buffers[1] = alloc(buffer_size_in_bytes);
     new_buffer->data_buffers[2] = alloc(buffer_size_in_bytes);
     new_buffer->current_buffer = 0;
-    new_buffer->read_interleaved = read_interleaved;
     new_buffer->sample_rate = 0;
     return new_buffer;
 }
@@ -83,6 +81,7 @@ rdx_audio_buffer_status rdx_open(rdx_audio_buffer* buf, const char* file, void**
         avformat_free_context(ctx);
         return AB_UKNWN_ERR;
     }
+    codec_ctx->request_sample_fmt = av_get_packed_sample_fmt(codec_ctx->sample_fmt);
     if(avcodec_open2(codec_ctx, codec,NULL) < 0) {
         avcodec_free_context(&codec_ctx);
         avformat_free_context(ctx);
@@ -101,15 +100,15 @@ rdx_audio_buffer_status rdx_open(rdx_audio_buffer* buf, const char* file, void**
         av_frame_free(&frame);
         return AB_ERR_NO_MEM;
     }
-    buf->bytes_per_sample = av_get_bytes_per_sample(buf->codec_ctx->sample_fmt);
+    buf->bytes_per_sample = av_get_bytes_per_sample(codec_ctx->sample_fmt);
     if(buf->bytes_per_sample < 0) {
         avcodec_free_context(&codec_ctx);
         avformat_free_context(ctx);
         av_frame_free(&frame);
         return AB_UKNWN_ERR;
     }
+    codec_ctx->max_samples = (buf->buffer_size_in_bytes) / (buf->bytes_per_sample * codec_ctx->ch_layout.nb_channels);
     buf->codec_ctx = codec_ctx;
-    buf->codec_ctx->max_samples = buf->buffer_size_in_bytes / (av_get_bytes_per_sample(codec_ctx->sample_fmt) / codec_ctx->ch_layout.nb_channels);
     buf->num_channels = codec_ctx->ch_layout.nb_channels;
     buf->packet = packet;
     buf->frame = frame;
@@ -136,32 +135,39 @@ rdx_audio_buffer_status rdx_close(rdx_audio_buffer* buf) {
 rdx_audio_buffer_status rdx_fill_next_buffer(rdx_audio_buffer* buf, void** out_data, size_t* out_data_size) {
     size_t available_bytes = buf->buffer_size_in_bytes;
     size_t bytes_written = 0;
-    if(av_read_frame(buf->format_ctx,buf->packet) >= 0) {
+    int response = av_read_frame(buf->format_ctx,buf->packet);
+    if(response >= 0 ) {
         int ret;
         do {
             ret = avcodec_send_packet(buf->codec_ctx, buf->packet);
             ret = avcodec_receive_frame(buf->codec_ctx,buf->frame);
         } while (ret == AVERROR(EAGAIN));
         void* data_to_write_to = buf->data_buffers[(int)buf->current_buffer];
-        if(buf->read_interleaved) {
+        // most audio playback is done in interleaved format. So we interleave the channel data manually.
+        if(av_sample_fmt_is_planar(buf->frame->format) ) {
             size_t bytes_to_write = buf->bytes_per_sample;
             for(int s =0; s < buf->frame->nb_samples; ++s) {
                 for(int ch = 0; ch < buf->num_channels; ++ch) {
-                    memcpy(((char*)data_to_write_to)+bytes_written, buf->frame->data[ch], bytes_to_write);
+                    memcpy(((char*)data_to_write_to)+bytes_written, &buf->frame->extended_data[ch][s*bytes_to_write], bytes_to_write);
                     bytes_written += bytes_to_write;
                 }
             }
-        }else {
-            size_t bytes_to_write = buf->frame->nb_samples * buf->bytes_per_sample;
-            for(int ch = 0; ch < buf->num_channels; ++ch) {
-                assert(bytes_written + bytes_to_write < available_bytes);
-                memcpy(((char*)data_to_write_to) + bytes_written, buf->frame->data[ch], bytes_to_write);
-                bytes_written += bytes_to_write;
-            }
+        } else {
+            // interleaved data, just copy straight into the output
+            size_t bytes_to_write = buf->frame->nb_samples * buf->bytes_per_sample * buf->num_channels;
+            assert((bytes_written + bytes_to_write) < available_bytes);
+            memcpy(((char*)data_to_write_to) + bytes_written, buf->frame->data[0], bytes_to_write);
+            bytes_written += bytes_to_write;
         }
         av_packet_unref(buf->packet);
         *out_data = buf->data_buffers[(int)buf->current_buffer];
         *out_data_size = (unsigned int)bytes_written;
+        // rotate buffer
+        buf->current_buffer = (buf->current_buffer+1) % 2;
+    }else if(response == AVERROR_EOF) {
+        return AB_LAST_FRAME;
+    }else {
+        return AB_UKNWN_ERR;
     }
     return AB_OK;
 }
@@ -172,4 +178,54 @@ void rdx_destroy_audio_stream(rdx_audio_buffer* buf) {
     dealloc(buf->data_buffers[1]);
     dealloc(buf->data_buffers[2]);
     dealloc(buf);
+}
+
+
+int rdx_get_number_of_channels(rdx_audio_buffer* buf) {
+    return buf->num_channels;
+}
+
+int rdx_get_sample_rate(rdx_audio_buffer* buf) {
+    return buf->sample_rate;
+}
+rdx_sample_format rdx_get_sample_format(rdx_audio_buffer* buf) {
+    switch (buf->codec_ctx->sample_fmt) {
+        case AV_SAMPLE_FMT_U8:
+            return U8;
+        case AV_SAMPLE_FMT_S16:
+            return S16;
+        case AV_SAMPLE_FMT_S32:
+            return S32;
+        case AV_SAMPLE_FMT_FLT:
+            return F32;
+        case AV_SAMPLE_FMT_U8P:
+            return U8;
+        case AV_SAMPLE_FMT_S16P:
+            return S16;
+        case AV_SAMPLE_FMT_S32P:
+            return S32;
+        case AV_SAMPLE_FMT_FLTP:
+            return F32;
+        default:
+            return UNSUPPORTED;
+    }
+}
+
+int rdx_get_bits_per_sample(rdx_audio_buffer* buf) {
+    switch(rdx_get_sample_format(buf)) {
+
+    case S8:
+    case U8:
+        return 8;
+    case S16:
+    case U16:
+        return 16;
+    case S32:
+    case U32:
+    case F32:
+        return 32;
+    default:
+        return -1;
+      break;
+    }
 }
